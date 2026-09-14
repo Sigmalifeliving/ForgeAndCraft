@@ -1,0 +1,67 @@
+# Environment variables and secrets (CONFIDENTIAL)
+.env
+.env.*
+!.env.example
+*.env
+*.pem
+*.key
+*.cert
+*.pfx
+*.pkcs12
+id_rsa*
+*.secret
+
+# Python & Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# SQLite / Database files
+*.db
+*.sqlite
+*.sqlite3
+forgecraft.db
+backend/forgecraft.db
+
+# Generated media / temp files
+backend/generated/
+backend/temp/
+generated/
+temp/
+
+# Node & Frontend
+node_modules/
+frontend/node_modules/
+dist/
+frontend/dist/
+dist-ssr/
+frontend/dist-ssr/
+*.local
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS & IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Large model weights & binaries
+backend/models/
+models/
+*.onnx
+*.bin
+
