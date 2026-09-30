@@ -1,6 +1,5 @@
 import { BrowserRouter, Routes, Route, Outlet } from 'react-router-dom';
 import { AuthProvider } from './context/AuthContext.jsx';
-import Sidebar from './components/Sidebar';
 import Navbar from './components/Navbar';
 import ProtectedRoute from './components/ProtectedRoute';
 import Home from './pages/Home';
@@ -19,12 +18,11 @@ import './App.css';
 
 function Layout() {
   return (
-    <div className="app-layout">
-      <Sidebar />
-      <div className="main-content">
-        <Navbar />
+    <div className="app-layout full-width-layout">
+      <Navbar />
+      <main className="main-content full-width">
         <Outlet />
-      </div>
+      </main>
     </div>
   );
 }
@@ -42,6 +40,10 @@ export default function App() {
             <Route path="/about" element={<About />} />
             <Route
               path="/dashboard"
+              element={<ProtectedRoute><Dashboard /></ProtectedRoute>}
+            />
+            <Route
+              path="/toolbox"
               element={<ProtectedRoute><Dashboard /></ProtectedRoute>}
             />
             <Route

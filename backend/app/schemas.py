@@ -85,9 +85,12 @@ class ThreeDGeneratePayload(BaseModel):
 
 class VoiceGeneratePayload(BaseModel):
     text: str = Field(min_length=1, max_length=5000)
-    voice: str = Field(default="voice-1")
-    engine: str = Field(default="cloud", pattern=r"^(cloud|local)$")
+    voice: str = Field(default="am_michael")
+    engine: str = Field(default="local", pattern=r"^(cloud|local)$")
     speed: float = Field(default=1.0, ge=0.5, le=2.0)
+    category: str = Field(default="auto")
+    duration: float = Field(default=0.0, ge=0.0, le=60.0)
+    mood: str = Field(default="", max_length=50)
 
 
 class AudioGeneratePayload(BaseModel):
@@ -99,12 +102,24 @@ class GamePlanRequest(BaseModel):
     idea: str = Field(min_length=3, max_length=2000)
     language: str = Field(default="English", max_length=50)
     style: str = Field(default="You decide", max_length=100)
+    budget: str = Field(default="medium", max_length=20)  # low | medium | high
+    mode: str = Field(default="live", max_length=20)  # live | demo
+
+
+class AudioDirection(BaseModel):
+    genre: str = ""
+    audio_direction: str = ""
+    primary_mood: list[str] = []
+    environment: str = ""
+    voice_style: str = ""
+    music_direction: str = ""
 
 
 class ProjectPlan(BaseModel):
     title: str = ""
     description: str = ""
     language: str = ""
+    genre: str = ""
 
 
 class _Extra:
@@ -112,8 +127,10 @@ class _Extra:
 
 
 class CharacterVoice(_Extra, BaseModel):
+    id: str = ""
     character: str
     role: str = ""
+    gender: str = ""
     personality: str = ""
     voice_type: str = ""
     age: str = ""
@@ -121,11 +138,20 @@ class CharacterVoice(_Extra, BaseModel):
     emotional_range: str = ""
     language: str = ""
     accent: str = ""
+    kokoro_voice: str = ""
+    speed: float = 1.0
+    pitch: str = ""
+    style: str = ""
     voice_prompt: str = ""
     preset: str = ""
+    asset_id: str = ""
+    status: str = "planned"  # planned | generating | ready | failed
+    duration: float = 0.0
+    audio_url: str = ""
 
 
 class DialogueItem(_Extra, BaseModel):
+    id: str = ""
     character: str
     scene: str = ""
     purpose: str = ""
@@ -136,9 +162,14 @@ class DialogueItem(_Extra, BaseModel):
     pitch: str = ""
     voice_prompt: str = ""
     preset: str = ""
+    asset_id: str = ""
+    status: str = "planned"
+    duration: float = 0.0
+    audio_url: str = ""
 
 
 class MusicTrack(_Extra, BaseModel):
+    id: str = ""
     title: str
     purpose: str = ""
     mood: str = ""
@@ -146,30 +177,48 @@ class MusicTrack(_Extra, BaseModel):
     instruments: str = ""
     energy: str = ""
     tempo: str = ""
-    duration: str = ""
-    loop: bool = False
+    duration: str = "30"
+    loop: bool = True
     generation_prompt: str = ""
+    asset_id: str = ""
+    status: str = "planned"
+    audio_duration: float = 0.0
+    audio_url: str = ""
 
 
 class SfxItem(_Extra, BaseModel):
+    id: str = ""
     name: str
+    category: str = "sfx"
     purpose: str = ""
     trigger: str = ""
     description: str = ""
-    duration: str = ""
+    duration: str = "2"
     generation_prompt: str = ""
+    asset_id: str = ""
+    status: str = "planned"
+    audio_duration: float = 0.0
+    audio_url: str = ""
 
 
 class AmbienceItem(_Extra, BaseModel):
+    id: str = ""
     name: str
     purpose: str = ""
     description: str = ""
+    duration: str = "30"
     loop: bool = True
     generation_prompt: str = ""
+    asset_id: str = ""
+    status: str = "planned"
+    audio_duration: float = 0.0
+    audio_url: str = ""
 
 
 class AudioPlan(BaseModel):
+    game_id: str = ""
     project: ProjectPlan = ProjectPlan()
+    direction: AudioDirection = AudioDirection()
     voices: list[CharacterVoice] = []
     dialogue: list[DialogueItem] = []
     music: list[MusicTrack] = []
@@ -182,4 +231,30 @@ class AudioPlan(BaseModel):
 class GamePlanOut(BaseModel):
     status: str = "completed"
     source: str = "mistral"
+    game_id: str = ""
     plan: AudioPlan
+
+
+class GenerateAssetPayload(BaseModel):
+    game_id: str
+    asset_id: str
+    regenerate: bool = False
+    voice: str | None = None
+    speed: float | None = None
+
+
+class AudioAssetOut(BaseModel):
+    id: str
+    game_id: str
+    category: str
+    item_id: str
+    name: str
+    description: str = ""
+    prompt: str = ""
+    model: str = ""
+    voice: str = ""
+    speed: float = 1.0
+    status: str = "planned"
+    duration: float = 0.0
+    file_path: str = ""
+    audio_url: str = ""

@@ -86,11 +86,23 @@ select {
   min-height: 100vh;
 }
 
+.app-layout.full-width-layout {
+  flex-direction: column;
+  width: 100%;
+}
+
 .main-content {
   flex: 1;
   margin-left: 240px;
   padding-top: 60px;
   min-height: 100vh;
+}
+
+.main-content.full-width,
+.app-layout.full-width-layout .main-content {
+  margin-left: 0;
+  padding-top: 76px;
+  width: 100%;
 }
 
 .page-container {

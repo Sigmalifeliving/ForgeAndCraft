@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text as sql_text
 
-from .api import assets, audio, auth, jobs, three_d, voice
+from .api import assets, audio, auth, gui, jobs, three_d, voice
 from .database import Base, engine
 
 Base.metadata.create_all(bind=engine)
@@ -39,7 +39,17 @@ app = FastAPI(title="ForgeCraft API", version="0.4.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+        "http://localhost:5175",
+        "http://127.0.0.1:5175",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -53,6 +63,7 @@ app.include_router(audio.music_router, prefix="/api")
 app.include_router(audio.sfx_router, prefix="/api")
 app.include_router(audio.ambience_router, prefix="/api")
 app.include_router(assets.router, prefix="/api")
+app.include_router(gui.router, prefix="/api")
 
 
 @app.get("/api/health")

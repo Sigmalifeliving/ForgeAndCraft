@@ -3,9 +3,10 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
-
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+load_dotenv(BASE_DIR / ".env")
+load_dotenv()  # Fallback to current working directory
 
 
 class Settings:
@@ -20,11 +21,10 @@ class Settings:
     KOKORO_VOICES_PATH: Path = MODELS_DIR / "voices-v1.0.bin"
     KOKORO_SAMPLE_RATE: int = 24000
 
-    # Mistral LLM (Audio Director). Leave MISTRAL_API_KEY empty to use the
-    # built-in demo plans (no API calls) so the planner always works.
+    # Mistral LLM (Audio Director).
     MISTRAL_API_KEY: str = os.getenv("MISTRAL_API_KEY", "")
     MISTRAL_BASE_URL: str = os.getenv("MISTRAL_BASE_URL", "https://api.mistral.ai/v1")
-    MISTRAL_MODEL: str = os.getenv("MISTRAL_MODEL", "mistral-small-latest")
+    MISTRAL_MODEL: str = os.getenv("MISTRAL_MODEL", "ministral-8b-latest")
     MISTRAL_TIMEOUT: int = int(os.getenv("MISTRAL_TIMEOUT", "120"))
 
     # Placeholder generator label for music/SFX/ambience until a real model

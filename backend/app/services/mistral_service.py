@@ -1,26 +1,28 @@
-"""Mistral-based Audio Director.
+"""Mistral-based Game Audio Director.
 
-Turns a one-line game idea into a structured, production-ready audio plan
-(voices, dialogue, music, sound effects and ambience) with generation
-prompts that can be handed directly to the app's audio generators.
+Acts as an experienced Game Audio Director + Sound Designer + Voice Director.
+Analyzes game ideas and produces structured JSON audio plans:
+- Characters & Voices (mapped to local Kokoro presets)
+- Dialogue lines
+- Music tracks (genre, tempo, energy, procedural prompts)
+- Sound effects (category, trigger, procedural prompts)
+- Ambience soundscapes
 
-Pipeline:
-    game idea -> Mistral (Stage 1: audio requirements)
-               -> Mistral (Stage 2: production-ready generation prompts)
-               -> validated AudioPlan
-
-If no MISTRAL_API_KEY is configured (or the LLM pipeline fails) a built-in
-themed demo plan is returned so the planner always works.
+No cloud audio generation requests are made to Mistral.
+Mistral is strictly the planning brain.
 """
 
 import json
+import logging
 import re
 import urllib.error
 import urllib.request
+import uuid
 
 from ..config import settings
 from ..schemas import (
     AmbienceItem,
+    AudioDirection,
     AudioPlan,
     CharacterVoice,
     DialogueItem,
@@ -30,131 +32,183 @@ from ..schemas import (
 )
 from .voice_service import VOICE_PRESETS
 
-_PRESETS = VOICE_PRESETS
-_PRESET_IDS = [v["id"] for v in _PRESETS]
+logger = logging.getLogger("forgecraft.mistral")
 
-_STAGE1_SYSTEM = """\
-You are the Audio Director for a game production studio. Your job is ONLY audio: \
-voice acting, character dialogue, narration, announcements, music, ambient audio \
-and sound effects. Never plan 3D models, environments, gameplay systems, UI, VFX \
-or Roblox implementation.
+_PRESET_IDS = [v["id"] for v in VOICE_PRESETS]
 
-Analyze the game idea strictly from an audio-production perspective and return a \
-single JSON object with exactly these keys:
+# Model fallback chain in case the primary model is throttled
+CANDIDATE_MODELS = [
+    settings.MISTRAL_MODEL,
+    "ministral-8b-latest",
+    "codestral-latest",
+    "ministral-3b-latest",
+]
 
-{
-  "project": {"title": "short game title", "description": "one-sentence audio pitch", "language": "spoken language"},
+_AUDIO_DIRECTOR_SYSTEM = """\
+You are an experienced Game Audio Director, Lead Sound Designer, and Voice Director for AAA & indie game studios.
+Your job is to analyze the user's game idea and construct a complete, production-grade Game Audio Plan.
+
+You must design audio strictly tailored to the game's genre, mood, tempo, and setting.
+Do NOT plan 3D models, code, physics, or graphics. Focus 100% on audio.
+
+Kokoro TTS Voice Presets available for characters:
+- "am_michael": Deep, confident, grounded male hero / warrior / commander
+- "am_adam": Calm, wise, gravelly elder / storyteller / mentor / narrator
+- "am_onyx": Dark, menacing, sinister villain / anti-hero / shadowy figure
+- "em_santa": Booming, theatrical, larger-than-life announcer / giant
+- "em_alex": Synthetic, mechanical, precise robot / cyborg / AI system
+- "af_heart": Warm, expressive, empathetic heroine / mother / guide
+- "af_bella": Ethereal, mystical, airy elf / goddess / fae spirit
+- "af_nova": Youthful, agile, curious scout / young adventurer
+- "af_sky": Bright, cheerful, playful, energetic companion
+
+You must return ONLY a single valid JSON object with EXACTLY this structure:
+{{
+  "game": {{
+    "title": "Evocative Game Title",
+    "genre": "Precise Game Genre",
+    "audio_direction": "High-level sound design philosophy (1-2 sentences)",
+    "primary_mood": ["mood1", "mood2", "mood3"],
+    "environment": "Key sound environments (e.g. abandoned wards, echoey corridors)",
+    "voice_style": "Vocal casting direction (e.g. whispered, controlled, desperate)",
+    "music_direction": "Musical style, BPM range, and instrumentation"
+  }},
   "voices": [
-    {
-      "character": "name",
-      "role": "narrator / coach / announcer / NPC / enemy / system voice",
-      "personality": "short personality",
-      "voice_type": "warm, deep, bright, raspy, etc.",
-      "age": "young adult, middle aged, elderly, child",
-      "speaking_style": "how the character speaks",
-      "emotional_range": "list of emotions",
-      "language": "language of the character",
-      "accent": "accent if relevant, else empty string"
-    }
+    {{
+      "id": "v_unique_id",
+      "character": "Character Name",
+      "role": "Narrator / NPC / Enemy / Announcer / Protagonist",
+      "gender": "male or female",
+      "age": "young adult, middle-aged, elderly, child, ageless",
+      "personality": "disturbing, calm, zealous, playful, etc.",
+      "voice_type": "low, raspy, bright, resonant, etc.",
+      "speaking_style": "how they speak, tempo, rhythm",
+      "emotional_range": "primary emotions expressed",
+      "kokoro_voice": "one of: am_michael, am_adam, am_onyx, em_santa, em_alex, af_heart, af_bella, af_nova, af_sky",
+      "speed": 0.85 to 1.15,
+      "pitch": "low, natural, or bright",
+      "style": "dark, warm, robotic, energetic, etc.",
+      "voice_prompt": "Detailed direction for speech synthesis"
+    }}
   ],
   "dialogue": [
-    {
-      "character": "must reference a voice from voices",
-      "scene": "Introduction / Tutorial / Gameplay / Mission / Victory / Failure / Warning / Story",
-      "purpose": "why this line exists",
-      "text": "actual spoken line in the game language",
-      "emotion": "short label such as Encouraging, Tense, Triumphant",
-      "speed": "Slow, Moderate or Fast",
-      "emphasis": "up to three key words, comma separated"
-    }
+    {{
+      "id": "d_unique_id",
+      "character": "Must match a Character Name from voices",
+      "scene": "Introduction / Tutorial / Warning / Combat / Victory / Story",
+      "purpose": "Why this spoken line is triggered in game",
+      "text": "Actual complete spoken dialogue sentence (no ellipsis)",
+      "emotion": "whispering, urgent, commanding, sarcastic, etc.",
+      "speed": "slow, moderate, or fast",
+      "emphasis": "key words emphasized",
+      "voice_prompt": "Delivery instruction for speech delivery"
+    }}
   ],
   "music": [
-    {
-      "title": "track name",
-      "purpose": "menu / gameplay / high-intensity / victory / defeat / results",
-      "mood": "short mood",
-      "genre": "concise genre",
-      "instruments": "key instruments",
-      "energy": "Low, Medium, High",
-      "tempo": "BPM value",
-      "duration": "duration in seconds",
-      "loop": true
-    }
+    {{
+      "id": "m_unique_id",
+      "title": "Track Title",
+      "purpose": "main menu / exploration / combat / boss / victory / safe zone",
+      "mood": "tense horror / sunny tropical / driving synth / mystical",
+      "genre": "dark ambient / synthwave / orchestral / tropical",
+      "instruments": "specific instruments (e.g. sub-bass, detuned piano, cello)",
+      "energy": "Low, Medium, or High",
+      "tempo": "80-160",
+      "duration": "30",
+      "loop": true,
+      "generation_prompt": "Detailed procedural music synthesizer prompt (instrumental, no vocals)"
+    }}
   ],
   "sfx": [
-    {
-      "name": "fx name",
-      "purpose": "where it is used",
-      "trigger": "what triggers it",
-      "description": "sound description",
-      "duration": "short / 1 second / brief hit, etc."
-    }
+    {{
+      "id": "s_unique_id",
+      "name": "SFX Name",
+      "category": "impact, movement, weapon, ui, environment, creature, or interaction",
+      "purpose": "where and when it triggers in gameplay",
+      "trigger": "player action or game event",
+      "description": "crisp description of the sound texture and layers",
+      "duration": "1-3",
+      "generation_prompt": "Prompt for local procedural audio synthesizer (isolated, clean)"
+    }}
   ],
   "ambience": [
-    {
-      "name": "ambience name",
-      "purpose": "which area/state it supports",
-      "description": "soundscape description",
-      "loop": true
-    }
+    {{
+      "id": "a_unique_id",
+      "name": "Ambience Name",
+      "purpose": "which level or room it loops in",
+      "description": "atmospheric soundscape elements (wind, resonance, dripping, distant hum)",
+      "duration": "30",
+      "loop": true,
+      "generation_prompt": "Prompt for ambient loop synthesizer (seamless loop)"
+    }}
   ]
-}
+}}
 
-Rules:
-- Only include what the game genuinely requires. No filler characters or tracks.
-- "ellipsis" is NOT allowed in dialogue text: write complete spoken lines.
-- Every array must contain between 1 and 10 items.
-- Dialogue characters must match entries in "voices".
-"""
+BUDGET CONSTRAINTS ({budget_label}):
+- Low Budget: 2-3 voices, 5-8 dialogue lines, 2-3 music tracks, 8-12 SFX, 2-3 ambience tracks.
+- Medium Budget: 3-5 voices, 10-15 dialogue lines, 3-5 music tracks, 12-18 SFX, 3-4 ambience tracks.
+- High Budget: 5-8 voices, 18-25 dialogue lines, 5-7 music tracks, 20-30 SFX, 4-6 ambience tracks.
 
-_STAGE2_SYSTEM = """\
-You are still the Audio Director for the same game. Enrich the provided audio plan \
-with production-ready GENERATION PROMPTS. Keep the EXACT same JSON shape, keys and \
-number of items (do not remove, rename or add items). Return JSON that adds, for every item:
-
-- voices: "voice_prompt" = a text-to-speech style description (tone, personality, \
-delivery, age) ready to pass to a TTS engine, and "preset" = the single most fitting \
-voice id from this allowed list: {presets}.
-- dialogue: "voice_prompt" = a delivery instruction for the line (emotion, speed, \
-emphasis, character voice), and "preset" = one fitting voice id from the allowed list.
-- music: "generation_prompt" = a music-generator prompt: mood, genre, instruments, \
-energy, tempo, loop requirement and the words "instrumental, no vocals".
-- sfx: "generation_prompt" = a sound-effect prompt describing the sound, its source, \
-that it is short/isolated and clean.
-- ambience: "generation_prompt" = an ambient loop prompt ending with "seamless loop".
-
-Also fill any empty optional fields with sensible values. Return the full updated JSON object.
+Every item must be specifically designed for the given game concept.
+Keep all text fields, prompts, and descriptions concise (under 25 words each). Complete all lists. Never truncate JSON.
+Do NOT return generic placeholder names like "Audio 1" or "Click".
+Output valid JSON only.
 """
 
 
-def _chat(messages: list[dict], max_tokens: int = 4096) -> dict:
-    url = settings.MISTRAL_BASE_URL.rstrip("/") + "/chat/completions"
-    body = {
-        "model": settings.MISTRAL_MODEL,
-        "messages": messages,
-        "temperature": 0.7,
-        "max_tokens": max_tokens,
-        "response_format": {"type": "json_object"},
-    }
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(body).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {settings.MISTRAL_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=settings.MISTRAL_TIMEOUT) as resp:
-            raw = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as err:
-        detail = err.read().decode("utf-8", errors="replace")[:400]
-        raise RuntimeError(f"Mistral HTTP {err.code}: {detail}") from err
-    except urllib.error.URLError as err:
-        raise RuntimeError(f"Mistral connection error: {err.reason}") from err
-    content = raw["choices"][0]["message"]["content"]
-    return _extract_json(content)
+def _chat_with_fallback(messages: list[dict], max_tokens: int = 6000) -> dict:
+    if not settings.MISTRAL_API_KEY:
+        raise RuntimeError("MISTRAL_API_KEY is not configured in backend/.env")
+
+    models_to_try = []
+    for m in CANDIDATE_MODELS:
+        if m and m not in models_to_try:
+            models_to_try.append(m)
+
+    last_error = None
+    for model_name in models_to_try:
+        url = settings.MISTRAL_BASE_URL.rstrip("/") + "/chat/completions"
+        body = {
+            "model": model_name,
+            "messages": messages,
+            "temperature": 0.7,
+            "max_tokens": max_tokens,
+            "response_format": {"type": "json_object"},
+        }
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {settings.MISTRAL_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            logger.info(f"Calling Mistral model: {model_name}...")
+            with urllib.request.urlopen(req, timeout=settings.MISTRAL_TIMEOUT) as resp:
+                raw = json.loads(resp.read().decode("utf-8"))
+            content = raw["choices"][0]["message"]["content"]
+            parsed = _extract_json(content)
+            logger.info(f"Mistral model {model_name} succeeded.")
+            return parsed
+        except urllib.error.HTTPError as err:
+            detail = err.read().decode("utf-8", errors="replace")[:300]
+            last_error = f"Mistral HTTP {err.code} ({model_name}): {detail}"
+            logger.warning(f"Mistral {model_name} HTTP {err.code}: {detail}")
+            if err.code in (429, 404, 503):
+                continue
+            raise RuntimeError(last_error) from err
+        except urllib.error.URLError as err:
+            last_error = f"Mistral connection error ({model_name}): {err.reason}"
+            logger.warning(last_error)
+            continue
+        except Exception as e:
+            last_error = f"Mistral processing error ({model_name}): {str(e)}"
+            logger.warning(last_error)
+            continue
+
+    raise RuntimeError(last_error or "All Mistral candidate models failed.")
 
 
 def _extract_json(content: str) -> dict:
@@ -168,6 +222,7 @@ def _extract_json(content: str) -> dict:
             return parsed
     except json.JSONDecodeError:
         pass
+
     decoder = json.JSONDecoder()
     start = content.find("{")
     while start != -1:
@@ -178,133 +233,224 @@ def _extract_json(content: str) -> dict:
         except json.JSONDecodeError:
             pass
         start = content.find("{", start + 1)
-    raise ValueError("No JSON object found in Mistral response")
-
-
-def _list_of(data: dict, key: str, model_cls) -> list:
-    value = data.get(key, []) if isinstance(data, dict) else []
-    if not isinstance(value, list):
-        return []
-    items = []
-    for entry in value[:10]:
-        if not isinstance(entry, dict):
-            continue
-        try:
-            items.append(model_cls.model_validate(entry))
-        except Exception:
-            continue
-    return items
+    raise ValueError("No valid JSON object found in Mistral response")
 
 
 def _recommend_preset(text: str, gender: str = "") -> str:
     t = (text or "").lower()
     if any(k in t for k in ("robot", "synthetic", "android", "mechanical", "cyborg", "ai ")):
         return "em_alex"
-    if any(k in t for k in ("villain", "dark", "menacing", "evil", "sinister", "monster", "demon")):
+    if any(k in t for k in ("villain", "dark", "menacing", "evil", "sinister", "monster", "demon", "zombie")):
         return "am_onyx"
-    if any(k in t for k in ("elder", "wise", "narrat", "storyteller", "ancient", "mentor", "old")):
+    if any(k in t for k in ("elder", "wise", "narrat", "storyteller", "ancient", "mentor", "old", "doctor")):
         return "am_adam"
-    if any(k in t for k in ("big", "booming", "giant", "larger-than-life", "announc", "stadium", "bulky")):
+    if any(k in t for k in ("big", "booming", "giant", "announc", "stadium", "referee")):
         return "em_santa"
-    if any(k in t for k in ("child", "kid", "scout", "youth", "young", "school")):
+    if any(k in t for k in ("child", "kid", "scout", "youth", "young", "cadet")):
         return "af_nova"
     if any(k in t for k in ("ethereal", "elf", "mystic", "goddess", "fairy", "fae", "magical", "spirit")):
         return "af_bella"
     if any(k in t for k in ("cheer", "bright", "happy", "light", "friendly", "party", "jolly")):
         return "af_sky"
-    if any(k in t for k in ("heroine", "warm", "gentle", "mother", "kind", "nurturing")):
+    if any(k in t for k in ("heroine", "warm", "gentle", "mother", "kind", "survivor female")):
         return "af_heart"
-    if any(k in t for k in ("hero", "deep", "grounded", "confident", "strong", "warrior", "captain")):
-        return "am_michael"
     if gender and "female" in gender.lower():
         return "af_heart"
     return "am_michael"
 
 
-def _gender_hint(entry: dict) -> str:
-    blob = " ".join(str(entry.get(k, "")) for k in ("voice_type", "age", "personality", "speaking_style"))
-    if "female" in blob.lower() or "woman" in blob.lower() or "girl" in blob.lower():
-        return "female"
-    if "male" in blob.lower() or "man" in blob.lower() or "boy" in blob.lower():
-        return "male"
-    return ""
+def _build_plan(payload: dict, idea: str, language: str, game_id: str) -> AudioPlan:
+    g_info = payload.get("game") or {}
+    if not isinstance(g_info, dict):
+        g_info = {}
 
+    title = str(g_info.get("title") or _title_from_idea(idea))[:120]
+    genre = str(g_info.get("genre") or "")[:80]
+    audio_dir = str(g_info.get("audio_direction") or f"Custom sound design tailored to {genre}")
+    environment = str(g_info.get("environment") or "")[:200]
+    voice_style = str(g_info.get("voice_style") or "")[:200]
+    music_dir = str(g_info.get("music_direction") or "")[:200]
 
-def _backfill_plan(plan: AudioPlan) -> AudioPlan:
-    by_name = {}
-    for v in plan.voices:
-        if not v.preset:
-            v.preset = _recommend_preset(
-                " ".join([v.character, v.personality, v.voice_type, v.speaking_style, v.age]),
-                _gender_hint(v.model_dump()),
-            )
-        if not v.voice_prompt:
-            v.voice_prompt = (
-                f"{v.voice_type or 'Natural'} voice with a {v.personality or 'engaging'} "
-                f"personality, {v.speaking_style or 'clear and natural'} delivery"
-                + (f", {v.age}" if v.age else "")
-                + (f", {v.accent} accent" if v.accent else "")
-                + "."
-            )
-        by_name[v.character.lower()] = v
+    raw_mood = g_info.get("primary_mood") or []
+    if isinstance(raw_mood, list):
+        primary_mood = [str(m).strip() for m in raw_mood if m]
+    elif isinstance(raw_mood, str):
+        primary_mood = [m.strip() for m in raw_mood.split(",") if m.strip()]
+    else:
+        primary_mood = ["immersive", "atmospheric"]
 
-    for d in plan.dialogue:
-        src = by_name.get(d.character.lower())
-        if not d.preset:
-            if src:
-                d.preset = src.preset
-            else:
-                d.preset = _recommend_preset(
-                    " ".join([d.character, d.emotion, d.purpose]), _gender_hint(d.model_dump())
-                )
-        if not d.voice_prompt:
-            base = f"Speak with a {d.emotion or 'natural'} tone"
-            if d.speed:
-                base += f", {d.speed.lower()} speed"
-            if d.emphasis:
-                base += f", emphasizing {d.emphasis}"
-            d.voice_prompt = base + "."
-
-    for m in plan.music:
-        if not m.generation_prompt:
-            loop_txt = "seamless loop" if m.loop else "no loop required"
-            m.generation_prompt = (
-                f"{m.mood or 'Uplifting'} {m.genre or 'instrumental'} music track, "
-                f"{m.energy or 'Medium'} energy, {m.tempo or '120'} BPM, "
-                f"featuring {m.instruments or 'warm instrumentation'}, instrumental, no vocals, {loop_txt}."
-            )
-    for s in plan.sfx:
-        if not s.generation_prompt:
-            s.generation_prompt = (
-                f"{s.description or s.name} sound effect, "
-                f"{s.duration or 'short'} duration, isolated and clean."
-            )
-    for a in plan.ambience:
-        if not a.generation_prompt:
-            a.generation_prompt = (
-                f"{a.description or a.name} ambient soundscape, immersive and subtle, seamless loop."
-            )
-    return plan
-
-
-def _build_plan(payload: dict, idea: str, language: str) -> AudioPlan:
-    project = payload.get("project") if isinstance(payload, dict) else {}
-    if not isinstance(project, dict):
-        project = {}
-    title = str(project.get("title") or _title_from_idea(idea))
-    plan = AudioPlan(
-        project=ProjectPlan(
-            title=title[:120],
-            description=str(project.get("description") or idea)[:500],
-            language=str(project.get("language") or language)[:50],
-        ),
-        voices=_list_of(payload, "voices", CharacterVoice),
-        dialogue=_list_of(payload, "dialogue", DialogueItem),
-        music=_list_of(payload, "music", MusicTrack),
-        sfx=_list_of(payload, "sfx", SfxItem),
-        ambience=_list_of(payload, "ambience", AmbienceItem),
+    direction = AudioDirection(
+        genre=genre,
+        audio_direction=audio_dir,
+        primary_mood=primary_mood[:6],
+        environment=environment,
+        voice_style=voice_style,
+        music_direction=music_dir,
     )
-    return _backfill_plan(plan)
+
+    project = ProjectPlan(
+        title=title,
+        description=str(g_info.get("description") or idea)[:500],
+        language=language[:50],
+        genre=genre,
+    )
+
+    # Voices
+    voices = []
+    voice_by_name = {}
+    for idx, v in enumerate(payload.get("voices") or []):
+        if not isinstance(v, dict):
+            continue
+        v_id = str(v.get("id") or f"v_{idx+1}")
+        char_name = str(v.get("character") or f"Character {idx+1}")
+        gender = str(v.get("gender") or "")
+        kokoro_voice = str(v.get("kokoro_voice") or v.get("preset") or "")
+        if kokoro_voice not in _PRESET_IDS:
+            kokoro_voice = _recommend_preset(
+                f"{char_name} {v.get('role', '')} {v.get('personality', '')} {v.get('voice_type', '')}",
+                gender,
+            )
+        speed = float(v.get("speed") or 1.0)
+        speed = max(0.75, min(1.3, speed))
+        c_voice = CharacterVoice(
+            id=v_id,
+            character=char_name,
+            role=str(v.get("role") or "Supporting Character"),
+            gender=gender,
+            personality=str(v.get("personality") or ""),
+            voice_type=str(v.get("voice_type") or ""),
+            age=str(v.get("age") or ""),
+            speaking_style=str(v.get("speaking_style") or ""),
+            emotional_range=str(v.get("emotional_range") or ""),
+            language=language,
+            accent=str(v.get("accent") or ""),
+            kokoro_voice=kokoro_voice,
+            preset=kokoro_voice,
+            speed=speed,
+            pitch=str(v.get("pitch") or "natural"),
+            style=str(v.get("style") or "natural"),
+            voice_prompt=str(
+                v.get("voice_prompt")
+                or f"Deliver in a {v.get('personality', 'natural')} tone with {v.get('speaking_style', 'clear')} pacing."
+            ),
+            asset_id=f"{game_id}_{v_id}",
+            status="planned",
+        )
+        voices.append(c_voice)
+        voice_by_name[char_name.lower()] = c_voice
+
+    # Dialogue
+    dialogue = []
+    for idx, d in enumerate(payload.get("dialogue") or []):
+        if not isinstance(d, dict):
+            continue
+        d_id = str(d.get("id") or f"d_{idx+1}")
+        char_name = str(d.get("character") or "Narrator")
+        matching_voice = voice_by_name.get(char_name.lower())
+        preset = matching_voice.preset if matching_voice else _recommend_preset(char_name)
+
+        speed_val = str(d.get("speed") or "moderate")
+        d_item = DialogueItem(
+            id=d_id,
+            character=char_name,
+            scene=str(d.get("scene") or "Gameplay"),
+            purpose=str(d.get("purpose") or "Atmosphere"),
+            text=str(d.get("text") or "Keep moving forward."),
+            emotion=str(d.get("emotion") or "Natural"),
+            speed=speed_val,
+            emphasis=str(d.get("emphasis") or ""),
+            pitch=str(d.get("pitch") or "natural"),
+            voice_prompt=str(
+                d.get("voice_prompt")
+                or f"Speak with a {d.get('emotion', 'clear')} tone at {speed_val} speed."
+            ),
+            preset=preset,
+            asset_id=f"{game_id}_{d_id}",
+            status="planned",
+        )
+        dialogue.append(d_item)
+
+    # Music
+    music = []
+    for idx, m in enumerate(payload.get("music") or []):
+        if not isinstance(m, dict):
+            continue
+        m_id = str(m.get("id") or f"m_{idx+1}")
+        m_track = MusicTrack(
+            id=m_id,
+            title=str(m.get("title") or f"Music Track {idx+1}"),
+            purpose=str(m.get("purpose") or "Exploration"),
+            mood=str(m.get("mood") or "Atmospheric"),
+            genre=str(m.get("genre") or genre or "Soundtrack"),
+            instruments=str(m.get("instruments") or "Synthesizer, percussion"),
+            energy=str(m.get("energy") or "Medium"),
+            tempo=str(m.get("tempo") or "120"),
+            duration=str(m.get("duration") or "30"),
+            loop=bool(m.get("loop", True)),
+            generation_prompt=str(
+                m.get("generation_prompt")
+                or f"{m.get('mood', 'Cinematic')} {m.get('genre', 'music')} track, {m.get('energy', 'Medium')} energy, {m.get('tempo', 120)} BPM, instrumental, no vocals."
+            ),
+            asset_id=f"{game_id}_{m_id}",
+            status="planned",
+        )
+        music.append(m_track)
+
+    # SFX
+    sfx = []
+    for idx, s in enumerate(payload.get("sfx") or []):
+        if not isinstance(s, dict):
+            continue
+        s_id = str(s.get("id") or f"s_{idx+1}")
+        s_item = SfxItem(
+            id=s_id,
+            name=str(s.get("name") or f"Sound Effect {idx+1}"),
+            category=str(s.get("category") or "environment"),
+            purpose=str(s.get("purpose") or "Feedback"),
+            trigger=str(s.get("trigger") or "Player action"),
+            description=str(s.get("description") or "Crisp sound effect"),
+            duration=str(s.get("duration") or "2"),
+            generation_prompt=str(
+                s.get("generation_prompt")
+                or f"{s.get('description', s.get('name', 'Sound effect'))}, isolated and clean."
+            ),
+            asset_id=f"{game_id}_{s_id}",
+            status="planned",
+        )
+        sfx.append(s_item)
+
+    # Ambience
+    ambience = []
+    for idx, a in enumerate(payload.get("ambience") or []):
+        if not isinstance(a, dict):
+            continue
+        a_id = str(a.get("id") or f"a_{idx+1}")
+        a_item = AmbienceItem(
+            id=a_id,
+            name=str(a.get("name") or f"Ambience {idx+1}"),
+            purpose=str(a.get("purpose") or "Area background"),
+            description=str(a.get("description") or "Ambient soundscape"),
+            duration=str(a.get("duration") or "30"),
+            loop=bool(a.get("loop", True)),
+            generation_prompt=str(
+                a.get("generation_prompt")
+                or f"{a.get('description', a.get('name', 'Ambient soundscape'))}, seamless loop."
+            ),
+            asset_id=f"{game_id}_{a_id}",
+            status="planned",
+        )
+        ambience.append(a_item)
+
+    return AudioPlan(
+        game_id=game_id,
+        project=project,
+        direction=direction,
+        voices=voices,
+        dialogue=dialogue,
+        music=music,
+        sfx=sfx,
+        ambience=ambience,
+    )
 
 
 def _title_from_idea(idea: str) -> str:
@@ -315,404 +461,519 @@ def _title_from_idea(idea: str) -> str:
     return t[:80].capitalize()
 
 
-def analyze_game_audio(idea: str, language: str = "English", style: str = "You decide") -> dict:
-    """Run the two-stage Mistral analysis. Returns {"source", "plan"}."""
-    if not settings.MISTRAL_API_KEY:
-        return {"source": "fallback", "plan": fallback_game_plan(idea, language, style)}
+def analyze_game_audio(
+    idea: str,
+    language: str = "English",
+    style: str = "You decide",
+    budget: str = "medium",
+    mode: str = "live",
+    game_id: str | None = None,
+) -> dict:
+    """Run the Audio Director analysis. Returns {"source", "game_id", "plan"}."""
+    if not game_id:
+        game_id = f"game_{uuid.uuid4().hex[:8]}"
 
-    user_stage1 = (
-        f"Game idea: {idea}\n\nLanguage: {language}\nStyle: {style}\n\n"
-        "Return only the JSON described in the system prompt."
+    if mode == "demo":
+        logger.info("Demo mode explicitly requested. Using built-in demo plan.")
+        plan = fallback_game_plan(idea, language, style, game_id)
+        return {"source": "demo", "game_id": game_id, "plan": plan}
+
+    # Live AI Mode
+    system_prompt = _AUDIO_DIRECTOR_SYSTEM.format(budget_label=budget.upper())
+    user_prompt = (
+        f"Game Idea: {idea}\n\n"
+        f"Language: {language}\n"
+        f"Style Preference: {style}\n"
+        f"Generation Budget: {budget}\n\n"
+        "Design the complete Game Audio Plan. Return ONLY the strict JSON object."
     )
-    try:
-        stage1 = _chat(
-            [
-                {"role": "system", "content": _STAGE1_SYSTEM},
-                {"role": "user", "content": user_stage1},
-            ]
-        )
-        stage2 = _chat(
-            [
-                {"role": "system", "content": _STAGE2_SYSTEM.format(presets=", ".join(_PRESET_IDS))},
-                {"role": "user", "content": f"Audio plan to enrich:\n{json.dumps(stage1, ensure_ascii=False)}"},
-            ]
-        )
-        plan = _build_plan(stage2, idea, language)
-        if not plan.voices and not plan.dialogue and not plan.music:
-            plan = _build_plan(stage1, idea, language)
-        return {"source": "mistral", "plan": plan}
-    except Exception:
-        return {"source": "fallback", "plan": fallback_game_plan(idea, language, style)}
+
+    # Call Mistral with model fallback
+    data = _chat_with_fallback(
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+    )
+
+    plan = _build_plan(data, idea, language, game_id)
+    return {"source": "mistral", "game_id": game_id, "plan": plan}
 
 
 # ---------------------------------------------------------------------------
-# Built-in themed demo plans (used when Mistral is not configured).
+# Themed Demo Plans (Used ONLY when user explicitly chooses Demo mode)
 # ---------------------------------------------------------------------------
 
+def fallback_game_plan(
+    idea: str, language: str = "English", style: str = "You decide", game_id: str = "game_demo"
+) -> AudioPlan:
+    t = (idea or "").lower()
+    if any(k in t for k in ("horror", "hospital", "zombie", "dark", "abandoned", "eerie", "ghost")):
+        theme_data = _HORROR_DEMO
+    elif any(k in t for k in ("surf", "wave", "ocean", "beach", "tropical", "water", "island")):
+        theme_data = _SURF_DEMO
+    elif any(k in t for k in ("fantasy", "magic", "rpg", "sword", "dragon", "knight", "forest")):
+        theme_data = _FANTASY_DEMO
+    elif any(k in t for k in ("race", "racing", "car", "drift", "speed", "cyber", "neon")):
+        theme_data = _RACING_DEMO
+    else:
+        theme_data = _GENERIC_DEMO
 
-def _th(character, role, personality, voice_type, age, speaking_style, emotional_range, preset, voice_prompt=""):
-    return {
-        "character": character,
-        "role": role,
-        "personality": personality,
-        "voice_type": voice_type,
-        "age": age,
-        "speaking_style": speaking_style,
-        "emotional_range": emotional_range,
-        "language": "English",
-        "accent": "",
-        "preset": preset,
-        "voice_prompt": voice_prompt
-        or f"{voice_type} voice, {personality.lower()} personality, {speaking_style.lower()} delivery, {age}.",
-    }
-
-
-def _dl(character, scene, purpose, text, emotion, speed, emphasis, preset, voice_prompt=""):
-    return {
-        "character": character,
-        "scene": scene,
-        "purpose": purpose,
-        "text": text,
-        "emotion": emotion,
-        "speed": speed,
-        "emphasis": emphasis,
-        "preset": preset,
-        "voice_prompt": voice_prompt
-        or f"Speak with a {emotion.lower()} tone, {speed.lower()} pace, emphasizing {emphasis}.",
-    }
+    return _build_plan(theme_data, idea, language, game_id)
 
 
-def _mu(title, purpose, mood, genre, instruments, energy, tempo, duration, loop, prompt):
-    return {
-        "title": title,
-        "purpose": purpose,
-        "mood": mood,
-        "genre": genre,
-        "instruments": instruments,
-        "energy": energy,
-        "tempo": tempo,
-        "duration": duration,
-        "loop": loop,
-        "generation_prompt": prompt,
-    }
-
-
-def _sfx(name, purpose, trigger, description, duration, prompt):
-    return {
-        "name": name,
-        "purpose": purpose,
-        "trigger": trigger,
-        "description": description,
-        "duration": duration,
-        "generation_prompt": prompt,
-    }
-
-
-def _amb(name, purpose, description, loop, prompt):
-    return {
-        "name": name,
-        "purpose": purpose,
-        "description": description,
-        "loop": loop,
-        "generation_prompt": prompt,
-    }
-
-
-_THEMES = {
-    "water": {
-        "title": "Surfing Game",
-        "voices": [
-            _th("Coach Kai", "Surfing instructor", "Energetic, supportive and confident",
-                "Strong and warm", "Adult", "Friendly and motivational",
-                "Encouraging, excited, proud", "am_michael"),
-            _th("Announcer", "Competition announcer", "Showman, larger than life",
-                "Big and booming", "Adult", "Rapid, theatrical",
-                "Excited, hype", "em_santa"),
-            _th("Riva", "Rival surfer", "Cocky, confident rival",
-                "Young and sharp", "Young adult", "Playful and taunting",
-                "Smug, surprised", "am_onyx"),
-            _th("Old Salt", "Lighthouse narrator", "Wise, weathered storyteller",
-                "Calm and gravelly", "Elderly", "Slow and reflective",
-                "Warm, nostalgic", "am_adam"),
-        ],
-        "dialogue": [
-            _dl("Coach Kai", "Introduction", "Welcome the player and start the tutorial",
-                "Welcome to the waves! Keep your balance and watch the next swell.",
-                "Encouraging", "Moderate", "balance, next swell", "am_michael"),
-            _dl("Coach Kai", "Tutorial", "Teach the first trick",
-                "Drop in low, shift your weight, and flick the tail for a turn.",
-                "Instructive", "Moderate", "weight, turn", "am_michael"),
-            _dl("Announcer", "Gameplay", "Announce a big wave",
-                "Here comes a monster set! Clear the lineup that header is closing in.",
-                "Hype", "Fast", "monster set, closing in", "em_santa"),
-            _dl("Riva", "Victory", "React when the player wins",
-                "You own this break today, but the low tide rematch is mine.",
-                "Gritted", "Moderate", "rematch", "am_onyx"),
-            _dl("Old Salt", "Story progression", "Set up the final reef challenge",
-                "Only one surfer has ever ridden the Reef King's wave. Legend says it still waits.",
-                "Mysterious", "Slow", "Reef King, waits", "am_adam"),
-        ],
-        "music": [
-            _mu("Coastal Menu", "Main menu", "Laid-back and sunny", "Tropical chill",
-                "Steel drums, acoustic guitar, soft percussion", "Low", "92", "24",
-                True, "Laid-back tropical chill track with steel drums and soft percussion, sunny beach mood, instrumental, no vocals, seamless loop."),
-            _mu("Gameplay Surf Theme", "Main gameplay soundtrack", "Energetic and adventurous",
-                "Tropical electronic", "Percussion, bright synths, energetic bass", "High", "125", "40",
-                True, "High-energy tropical electronic surf soundtrack with rhythmic percussion, bright synths and energetic bass, adventurous ocean atmosphere, instrumental, no vocals, seamless loop."),
-            _mu("Victory Fanfare", "Victory", "Triumphant and bright", "Celebratory pop",
-                "Horns, drums, glockenspiel", "High", "110", "16",
-                False, "Triumphant celebratory fanfare with bright horns and drums, victorious atmosphere, instrumental, no vocals."),
-        ],
-        "sfx": [
-            _sfx("Wave Impact", "Landing", "Player lands after jumping a wave",
-                "Heavy water splash with a short surfboard impact", "1 second",
-                "Realistic ocean wave impact with a sharp surfboard splash, energetic water movement, short duration, clean isolated sound."),
-            _sfx("Board Spray", "Movement", "Player carves a turn",
-                "Frothy water spray from the board edge", "Short",
-                "Bright frothy water spray sound, quick and bright, short duration, isolated and clean."),
-            _sfx("Crowd Cheer", "Reward", "Player earns points in a competition",
-                "Distant cheering crowd swell", "2 seconds",
-                "Distant crowd cheering swell, warm and celebratory, medium duration, mixed but clear."),
-        ],
-        "ambience": [
-            _amb("Ocean Beach Loop", "Menu and free-surf states",
-                "Gentle waves, seagulls, soft wind and water movement", True,
-                "Natural tropical ocean ambience with gentle waves, soft wind and distant seabirds, seamless loop, relaxing but immersive."),
-        ],
+_HORROR_DEMO = {
+    "game": {
+        "title": "Abandoned Hospital: Patient Zero",
+        "genre": "Dark Horror Survival",
+        "audio_direction": "Oppressive silence punctuated by sudden resonant clangs, whispered delusions, and subsonic heartbeats.",
+        "primary_mood": ["Dark", "Tense", "Dread", "Claustrophobic"],
+        "environment": "Decaying psychiatric ward, wet tiled hallways, flickering fluorescent hum",
+        "voice_style": "Low, trembling, feverish, and desperate",
+        "music_direction": "Sub-bass drones, bowed cymbals, dissonant strings, 70 BPM",
     },
-    "space": {
-        "title": "Space Game",
-        "voices": [
-            _th("Mission Control", "Mission coordinator", "Calm, professional and reassuring",
-                "Smooth, even", "Adult", "Clear and controlled",
-                "Calm, focused, urgent", "am_adam"),
-            _th("ORBI", "Ship AI", "Helpful, dryly witty synthetic",
-                "Synthetic and clean", "Ageless", "Precise, crisp",
-                "Neutral, amused", "em_alex"),
-            _th("Captain Vega", "Player's commander", "Bold and charismatic leader",
-                "Firm and warm", "Adult", "Commanding and motivational",
-                "Determined, proud", "am_michael"),
-            _th("Nova", "Alien scout", "Curious and youthful",
-                "Bright and agile", "Young", "By-the-cheek, playful",
-                "Curious, excited", "af_nova"),
-        ],
-        "dialogue": [
-            _dl("Mission Control", "Introduction", "Establish the mission",
-                "Omega station online. Squad, we are go for the relay run.",
-                "Professional", "Moderate", "go, relay run", "am_adam"),
-            _dl("ORBI", "Warning", "Alert player to low oxygen",
-                "WARNING: oxygen reserves at fifteen percent. Recommend immediate resupply.",
-                "Neutral-alert", "Fast", "fifteen percent, resupply", "em_alex"),
-            _dl("Captain Vega", "Mission instructions", "Give the objective",
-                "Take the ring gate, hold the lane, and bring us home picture perfect.",
-                "Confident", "Moderate", "ring gate, hold the lane", "am_michael"),
-        ],
-        "music": [
-            _mu("Nebula Drift", "Exploration", "Vast and ambient", "Ambient synthwave",
-                "Pads, soft arps, sub bass", "Low", "70", "40",
-                True, "Vast ambient synthwave pad track with soft arpeggios and sub bass, drifting space mood, instrumental, no vocals, seamless loop."),
-            _mu("Combat Pulse", "Combat", "Tense and driving", "Dark electronic",
-                "Percussion, distorted synth, pulse bass", "High", "150", "36",
-                True, "Driving dark electronic combat theme with pulsing bass and tense percussion, high energy, instrumental, no vocals, seamless loop."),
-        ],
-        "sfx": [
-            _sfx("Engine Burn", "Movement", "Throttling the engines",
-                "Deep rumble with a rising whoosh", "2 seconds",
-                "Deep thruster rumble with a rising whoosh, powerful and smooth, short duration, isolated and clean."),
-            _sfx("Laser Blast", "Combat", "Firing the ship cannon",
-                "Sharp ripping pulse with echo", "Short",
-                "Sharp ripping laser pulse with a slight echo, futuristic and clean, short duration, isolated."),
-            _sfx("Pilot Warning", "System", "HUD alert",
-                "Chirping double beep", "Brief hit",
-                "Quick chirping double beep UI alert, bright and clear, very short, isolated sound."),
-        ],
-        "ambience": [
-            _amb("Deep Space Hiss", "Spaceflight moments",
-                "Subtle hiss, distant hums and fading radio chatter", True,
-                "Subtle deep space ambience with soft hiss, distant machinery hum and faint radio signals, seamless loop, immersive and quiet."),
-        ],
-    },
-    "fantasy": {
-        "title": "Fantasy Game",
-        "voices": [
-            _th("Alaric", "Wizard mentor", "Wise, kind and slightly mischievous",
-                "Warm, rich", "Elderly", "Measured and mystical",
-                "Calm, amused, serious", "am_adam"),
-            _th("Lyra", "Heroine", "Brave, empathetic protagonist",
-                "Warm and expressive", "Young adult", "Determined and heartfelt",
-                "Hopeful, fierce, tender", "af_heart"),
-            _th("Malakar", "Dark sorcerer", "Cold, menacing antagonist",
-                "Deep, dark", "Ageless", "Slow, deliberate threats",
-                "Smug, furious", "am_onyx"),
-            _th("Eldrin", "Elven guide", "Graceful and ethereal",
-                "Ethereal, airy", "Ancient", "Soft and lyrical",
-                "Serene, sorrowful", "af_bella"),
-        ],
-        "dialogue": [
-            _dl("Alaric", "Introduction", "Introduce the threat",
-                "The shard was sealed for a thousand years, child. Tonight it wakes.",
-                "Mysterious", "Slow", "sealed, wakes", "am_adam"),
-            _dl("Lyra", "Mission instructions", "Set the quest",
-                "If I hold the amulet clear of the rites, you shatter the seal from outside.",
-                "Determined", "Moderate", "amulet, shatter the seal", "af_heart"),
-            _dl("Malakar", "Story progression", "Villain ultimatum",
-                "Bow to the shadow, and I will let your village keep its embers.",
-                "Menacing", "Slow", "bow, embers", "am_onyx"),
-        ],
-        "music": [
-            _mu("Tavern Shadows", "Safe hubs", "Warm yet mysterious", "Folk fantasy",
-                "Lute, violin, soft drums", "Low", "84", "36",
-                True, "Warm folk fantasy tavern tune with lute and violin, cozy but mysterious, instrumental, no vocals, seamless loop."),
-            _mu("Epic Battle", "Combat", "Heroic and urgent", "Epic orchestral",
-                "Brass, strings, timpani", "High", "140", "44",
-                True, "Heroic epic orchestral battle theme with brass, strings and timpani, urgent and sweeping, instrumental, no vocals, seamless loop."),
-        ],
-        "sfx": [
-            _sfx("Spell Cast", "Action", "Casting a spell",
-                "Whooshing burst with magical chime", "1 second",
-                "Whooshing magical burst with a bright chime, arcane and clean, short duration, isolated sound."),
-            _sfx("Sword Strike", "Combat", "Hitting an enemy",
-                "Metallic clash with recoil", "Short",
-                "Metallic sword clash with a sharp recoil ring, quick and clean, short duration, isolated."),
-            _sfx("Potion Fizz", "Pickup", "Drinking a heal potion",
-                "Bubbling pop", "Short",
-                "Bubbling potion fizz with a light pop, playful and clean, short duration, isolated."),
-        ],
-        "ambience": [
-            _amb("Mystic Forest", "Exploration areas",
-                "Wind through leaves, distant birds, faint magic hum", True,
-                "Mystic forest ambience with wind, rustling leaves, distant birds and a faint magical hum, seamless loop, immersive."),
-        ],
-    },
-    "racing": {
-        "title": "Racing Game",
-        "voices": [
-            _th("Turbo T", "Race announcer", "High-energy showman",
-                "Big and punchy", "Adult", "Rapid-fire enthusiasm",
-                "Hype, dramatic", "em_santa"),
-            _th("Mechanic Ed", "Garage coach", "Pragmatic, friendly expert",
-                "Raspy and grounded", "Adult", "Casual and direct",
-                "Helpful, excited", "am_michael"),
-            _th("Viper", "Rival driver", "Slick and competitive",
-                "Smooth, cocky", "Young adult", "Smirking one-liners",
-                "Smug, surprised", "am_onyx"),
-        ],
-        "dialogue": [
-            _dl("Turbo T", "Countdown", "Start the race",
-                "Engines ready! Lights out, and it is GO!",
-                "Hype", "Fast", "lights out, GO", "em_santa"),
-            _dl("Mechanic Ed", "Tutorial", "Explain drifting",
-                "Brake late, flick the wheel, and let the throttle pull you through the corner.",
-                "Instructive", "Moderate", "brake late, throttle", "am_michael"),
-            _dl("Viper", "Defeat", "Rival taunt after losing",
-                "Nice try, rookie. My crew will be polishing that trophy all week.",
-                "Smug", "Moderate", "trophy, all week", "am_onyx"),
-        ],
-        "music": [
-            _mu("Garage Menu", "Main menu", "Cool and gritty", "City electronic",
-                "Synth, electric guitar, heavy drums", "Medium", "100", "30",
-                True, "Cool city electronic garage track with synth and electric guitar, gritty mood, instrumental, no vocals, seamless loop."),
-            _mu("Race Groove", "Races", "Pumping and fast", "Electronic rock",
-                "Driving drums, bass, leads", "High", "160", "48",
-                True, "Pumping electronic rock race theme with driving drums and bass, fast and intense, instrumental, no vocals, seamless loop."),
-        ],
-        "sfx": [
-            _sfx("Engine Rev", "Movement", "Revving at the start line",
-                "Deep engine rise to a roar", "2 seconds",
-                "Deep racing engine rev rising to a full roar, powerful and clean, short duration, isolated."),
-            _sfx("Tire Screech", "Drifting", "A sharp corner drift",
-                "High-pitched tire skid", "Short",
-                "Sharp high-pitched tire screech during a drift, quick and aggressive, short duration, isolated sound."),
-            _sfx("Checkpoint", "Progress", "Passing a checkpoint",
-                "Energetic beep with whoosh", "Brief hit",
-                "Energetic two-tone checkpoint beep with a light whoosh, bright and clear, very short, isolated."),
-        ],
-        "ambience": [
-            _amb("Paddock Crowd", "Menus and garage",
-                "Distant crowd, engines, tool clatter", True,
-                "Racing paddock ambience with distant crowd noise, engine rumble and workshop clatter, seamless loop, low and immersive."),
-        ],
-    },
-    "generic": {
-        "title": "New Game",
-        "voices": [
-            _th("Storyteller", "Narrator", "Warm, wise and engaging",
-                "Calm and even", "Middle aged", "Measured, cinematic",
-                "Steady, emotional", "am_adam"),
-            _th("Gunner", "Hero", "Brave and dependable",
-                "Grounded and warm", "Young adult", "Confident and direct",
-                "Hopeful, determined", "am_michael"),
-            _th("Tilly", "Tutorial guide", "Cheerful and encouraging",
-                "Bright and light", "Young", "Playful and upbeat",
-                "Cheerful, excited", "af_sky"),
-        ],
-        "dialogue": [
-            _dl("Storyteller", "Introduction", "Set the scene",
-                "Every journey begins the same way: one step forward and no looking back.",
-                "Warm", "Moderate", "one step, no looking back", "am_adam"),
-            _dl("Tilly", "Tutorial", "Teach the core action",
-                "Use the prompt to act, and keep an eye on your resources up here.",
-                "Encouraging", "Moderate", "act, resources", "af_sky"),
-            _dl("Gunner", "Victory", "Celebrate a win",
-                "That is how it is done. Round two, and this time we finish the route.",
-                "Triumphant", "Fast", "done, finish the route", "am_michael"),
-        ],
-        "music": [
-            _mu("Title Theme", "Main menu", "Hopeful and clear", "Epic trailer music",
-                "Strings, choir, soft drums", "Medium", "100", "20",
-                True, "Hopeful epic title theme with warm strings and soft drums, cinematic and clear, instrumental, no vocals, seamless loop."),
-            _mu("Main Gameplay", "Gameplay loop", "Active and motivating", "Modern electronic",
-                "Drums, bass, bright leads", "High", "128", "36",
-                True, "Active modern electronic gameplay track with driving drums, bass and bright leads, motivating energy, instrumental, no vocals, seamless loop."),
-        ],
-        "sfx": [
-            _sfx("UI Click", "Interface", "Pressing a button",
-                "Soft click with slight pop", "Brief hit",
-                "Soft UI button click with a light pop, clean and subtle, very short, isolated sound."),
-            _sfx("Pickup", "Collectible", "Collecting an item",
-                "Bright rising coin-like chime", "Short",
-                "Bright rising collectible chime, cheerful and clean, short duration, isolated."),
-            _sfx("Success", "Reward", "Completing an objective",
-                "Satisfying major chord ding", "1 second",
-                "Satisfying major-chord success ding, warm and positive, short duration, isolated."),
-        ],
-        "ambience": [
-            _amb("Main Hub", "Hub and menus",
-                "Soft room tone with distant activity", True,
-                "Soft game hub ambience with gentle room tone and distant activity, subtle and calm, seamless loop."),
-        ],
-    },
+    "voices": [
+        {
+            "id": "v_doctor",
+            "character": "Dr. Mercer",
+            "role": "Chief Surgeon / Antagonist",
+            "gender": "male",
+            "age": "middle-aged",
+            "personality": "Calm, clinical, chillingly detached",
+            "voice_type": "Low and controlled",
+            "speaking_style": "Slow, methodical, surgical",
+            "kokoro_voice": "am_onyx",
+            "speed": 0.88,
+            "pitch": "low",
+            "style": "dark",
+            "voice_prompt": "Low, slow, clinical male voice with disturbing calmness.",
+        },
+        {
+            "id": "v_survivor",
+            "character": "Claire",
+            "role": "Protagonist / Survivor",
+            "gender": "female",
+            "age": "young adult",
+            "personality": "Terrified yet determined",
+            "voice_type": "Breathless, strained",
+            "speaking_style": "Fast whispered delivery",
+            "kokoro_voice": "af_heart",
+            "speed": 1.05,
+            "pitch": "natural",
+            "style": "tense",
+            "voice_prompt": "Breathless female voice, tense and whispered.",
+        },
+        {
+            "id": "v_intercom",
+            "character": "Automated Intercom",
+            "role": "Facility System Voice",
+            "gender": "male",
+            "age": "ageless",
+            "personality": "Cold and sterile",
+            "voice_type": "Mechanical with slight distortion",
+            "speaking_style": "Robotic cadence",
+            "kokoro_voice": "em_alex",
+            "speed": 0.95,
+            "pitch": "natural",
+            "style": "synthetic",
+            "voice_prompt": "Monotone synthetic PA announcer with metallic resonance.",
+        },
+    ],
+    "dialogue": [
+        {
+            "id": "d_intro",
+            "character": "Claire",
+            "scene": "Opening Scene",
+            "purpose": "Establish vulnerability",
+            "text": "The emergency doors are welded shut from the outside. Something is in here with me.",
+            "emotion": "whispering",
+            "speed": "moderate",
+            "emphasis": "welded shut, with me",
+        },
+        {
+            "id": "d_taunt",
+            "character": "Dr. Mercer",
+            "scene": "Hallway Encounter",
+            "purpose": "Psychological terror",
+            "text": "Do not resist the procedure, Claire. Sickness is merely an unanswered symptom.",
+            "emotion": "chilling",
+            "speed": "slow",
+            "emphasis": "procedure, sickness",
+        },
+        {
+            "id": "d_warning",
+            "character": "Automated Intercom",
+            "scene": "Facility Quarantine",
+            "purpose": "Environmental hazard alert",
+            "text": "Code Black in Ward B. Total decontamination protocol initiating in three minutes.",
+            "emotion": "sterile",
+            "speed": "moderate",
+            "emphasis": "Code Black, decontamination",
+        },
+        {
+            "id": "d_escape",
+            "character": "Claire",
+            "scene": "Generator Room",
+            "purpose": "Pushed to the brink",
+            "text": "If I can restore backup power to the elevator shaft, I might make it to the roof.",
+            "emotion": "determined",
+            "speed": "fast",
+            "emphasis": "backup power, elevator shaft",
+        },
+    ],
+    "music": [
+        {
+            "id": "m_exploration",
+            "title": "Corridor of Whispers",
+            "purpose": "Exploration gameplay",
+            "mood": "Dark ambient horror",
+            "genre": "Horror ambient",
+            "instruments": "Sub-bass, bowing metals, distant detuned piano",
+            "energy": "Low",
+            "tempo": "72",
+            "duration": "45",
+            "loop": True,
+            "generation_prompt": "Eerie dark ambient horror drone with sub-bass and metallic scrapes, tense and claustrophobic, instrumental, no vocals, seamless loop.",
+        },
+        {
+            "id": "m_pursuit",
+            "title": "Scapel Chase",
+            "purpose": "Combat / monster pursuit",
+            "mood": "High panic and dread",
+            "genre": "Dark cinematic industrial",
+            "instruments": "Distorted tribal percussion, screeching strings, pulse bass",
+            "energy": "High",
+            "tempo": "135",
+            "duration": "30",
+            "loop": True,
+            "generation_prompt": "High-intensity dark horror pursuit theme with heavy distorted percussion and screeching strings, panic atmosphere, instrumental, no vocals, seamless loop.",
+        },
+    ],
+    "sfx": [
+        {
+            "id": "s_door_creak",
+            "name": "Heavy Metal Hospital Door Creak",
+            "category": "environment",
+            "purpose": "Entering treatment rooms",
+            "trigger": "Door interaction",
+            "description": "Slow agonizing rusty hinge groan with echoing reverberation",
+            "duration": "3",
+            "generation_prompt": "Old rusty hospital door slowly creaking open with metallic friction and echo, isolated and clean.",
+        },
+        {
+            "id": "s_heartbeat",
+            "name": "Panic Heartbeat Surge",
+            "category": "feedback",
+            "purpose": "Low health / proximity indicator",
+            "trigger": "Monster near player",
+            "description": "Sub-bass pulse with muffling ear pressure effect",
+            "duration": "2",
+            "generation_prompt": "Deep thumping heartbeat pulse in heavy acoustic space, muffling bass thump, isolated and clean.",
+        },
+        {
+            "id": "s_glass_shatter",
+            "name": "Medical Vial Shatter",
+            "category": "impact",
+            "purpose": "Distraction mechanic",
+            "trigger": "Throwing an object",
+            "description": "Sharp high-frequency glass crash with liquid splatter",
+            "duration": "2",
+            "generation_prompt": "Sharp glass vial shattering on hospital tile floor with quick liquid splash, isolated and clean.",
+        },
+        {
+            "id": "s_monster_growl",
+            "name": "Mutated Specimen Growl",
+            "category": "creature",
+            "purpose": "Enemy detection",
+            "trigger": "Enemy nearby",
+            "description": "Guttural wet snarl with ragged breathing",
+            "duration": "3",
+            "generation_prompt": "Guttural mutated creature snarl with wet rasp and deep resonance, isolated and clean.",
+        },
+    ],
+    "ambience": [
+        {
+            "id": "a_ward",
+            "name": "Psychiatric Ward Room Tone",
+            "purpose": "Main indoor exploration",
+            "description": "Low drone, flickering fluorescent ballast buzz, distant pipe dripping",
+            "duration": "30",
+            "loop": True,
+            "generation_prompt": "Dark abandoned hospital room tone with low drone, electrical fluorescent buzz, and distant dripping water, seamless loop.",
+        }
+    ],
 }
 
+_SURF_DEMO = {
+    "game": {
+        "title": "Sunburst Surfers",
+        "genre": "Tropical Sports & Adventure",
+        "audio_direction": "Bright, uplifting, energetic soundscape filled with warm ocean spray, cheering fans, and steel pan grooves.",
+        "primary_mood": ["Energetic", "Sunny", "Playful", "Adventurous"],
+        "environment": "Golden sands, crashing reef breaks, lively boardwalk",
+        "voice_style": "Friendly, hype, confident, and sun-soaked",
+        "music_direction": "Upbeat tropical electronic, steel drums, acoustic plucks, 128 BPM",
+    },
+    "voices": [
+        {
+            "id": "v_coach",
+            "character": "Coach Kai",
+            "role": "Mentor",
+            "gender": "male",
+            "age": "adult",
+            "personality": "Supportive and high-energy",
+            "voice_type": "Warm and resonant",
+            "speaking_style": "Motivational and enthusiastic",
+            "kokoro_voice": "am_michael",
+            "speed": 1.0,
+            "pitch": "natural",
+            "style": "warm",
+            "voice_prompt": "Warm, encouraging male voice with lively surf enthusiasm.",
+        },
+        {
+            "id": "v_announcer",
+            "character": "Duke Hype",
+            "role": "Tournament Announcer",
+            "gender": "male",
+            "age": "adult",
+            "personality": "Showman, loud, charismatic",
+            "voice_type": "Booming and theatrical",
+            "speaking_style": "Rapid tournament delivery",
+            "kokoro_voice": "em_santa",
+            "speed": 1.15,
+            "pitch": "bright",
+            "style": "energetic",
+            "voice_prompt": "Booming, enthusiastic sports announcer voice with big energy.",
+        },
+    ],
+    "dialogue": [
+        {
+            "id": "d_dropin",
+            "character": "Coach Kai",
+            "scene": "Wave Drop",
+            "purpose": "Tutorial tip",
+            "text": "Drop in right down the shoulder, bend your knees, and carve hard into the pocket!",
+            "emotion": "enthusiastic",
+            "speed": "moderate",
+            "emphasis": "drop in, carve hard",
+        },
+        {
+            "id": "d_bigwave",
+            "character": "Duke Hype",
+            "scene": "Monster Wave",
+            "purpose": "Hype moment",
+            "text": "Look at the size of that twenty-foot barrel! Unbelievable aerial incoming!",
+            "emotion": "hyped",
+            "speed": "fast",
+            "emphasis": "twenty-foot, aerial incoming",
+        },
+    ],
+    "music": [
+        {
+            "id": "m_surf_beat",
+            "title": "Tide Rider Groove",
+            "purpose": "Gameplay soundtrack",
+            "mood": "Tropical sunshine adventure",
+            "genre": "Tropical House",
+            "instruments": "Steel drums, bright plucks, rolling house bass",
+            "energy": "High",
+            "tempo": "125",
+            "duration": "30",
+            "loop": True,
+            "generation_prompt": "Upbeat tropical electronic dance track with steel drums, bright synths and energetic ocean vibes, instrumental, no vocals, seamless loop.",
+        }
+    ],
+    "sfx": [
+        {
+            "id": "s_wave_crash",
+            "name": "Heavy Ocean Wave Crash",
+            "category": "environment",
+            "purpose": "Wave crest breaking",
+            "trigger": "Wave break",
+            "description": "Massive surging water impact with foamy fizz",
+            "duration": "2",
+            "generation_prompt": "Massive ocean wave crashing down with heavy water impact and frothy spray, isolated and clean.",
+        },
+        {
+            "id": "s_board_snap",
+            "name": "Surfboard Snap Turn",
+            "category": "movement",
+            "purpose": "Sharp carving turn",
+            "trigger": "Player turns",
+            "description": "Crisp spray whoosh with board friction",
+            "duration": "1",
+            "generation_prompt": "Crisp surfboard carving through seawater with bright spray and splash, isolated and clean.",
+        },
+    ],
+    "ambience": [
+        {
+            "id": "a_beach",
+            "name": "Tropical Beach Atmosphere",
+            "purpose": "Main menu and free roam",
+            "description": "Rolling ocean swells, gentle breeze, distant seagulls",
+            "duration": "30",
+            "loop": True,
+            "generation_prompt": "Sunny tropical beach ambience with gentle breaking waves, ocean breeze and distant seagulls, seamless loop.",
+        }
+    ],
+}
 
-def fallback_game_plan(idea: str, language: str = "English", style: str = "You decide") -> AudioPlan:
-    idea = idea or "Create a video game"
-    key = _theme_for(idea)
-    theme = _THEMES[key]
+_FANTASY_DEMO = {
+    "game": {
+        "title": "Chronicles of Eldoria",
+        "genre": "High Fantasy Action RPG",
+        "audio_direction": "Epic orchestral grandeur layered with mystical wind chimes and archaic incantations.",
+        "primary_mood": ["Epic", "Mystical", "Heroic", "Ancient"],
+        "environment": "Whispering enchanted groves, crumbling stone keeps, torchlit dungeons",
+        "voice_style": "Regal, wise, commanding, and arcane",
+        "music_direction": "Celtic folk meets cinematic orchestra, 110 BPM",
+    },
+    "voices": [
+        {
+            "id": "v_mage",
+            "character": "Grand Mage Vael",
+            "role": "Mentor / Wizard",
+            "gender": "male",
+            "age": "elderly",
+            "personality": "Mystical and solemn",
+            "voice_type": "Deep, resonant, ancient",
+            "speaking_style": "Deliberate and rhythmic",
+            "kokoro_voice": "am_adam",
+            "speed": 0.9,
+            "pitch": "low",
+            "style": "mystical",
+            "voice_prompt": "Wise, elderly wizard voice with calm mystical cadence.",
+        }
+    ],
+    "dialogue": [
+        {
+            "id": "d_prophecy",
+            "character": "Grand Mage Vael",
+            "scene": "Quest Start",
+            "purpose": "Lore introduction",
+            "text": "The ancient runes illuminate the forest path once more. Take the enchanted blade.",
+            "emotion": "solemn",
+            "speed": "slow",
+            "emphasis": "ancient runes, enchanted blade",
+        }
+    ],
+    "music": [
+        {
+            "id": "m_tavern",
+            "title": "Hearth of the Gryphon",
+            "purpose": "Safe hub / village",
+            "mood": "Warm and festive",
+            "genre": "Medieval Folk",
+            "instruments": "Lute, wooden flute, hand drums",
+            "energy": "Medium",
+            "tempo": "104",
+            "duration": "30",
+            "loop": True,
+            "generation_prompt": "Warm medieval folk tavern melody with lute and flute, cozy and lively, instrumental, no vocals, seamless loop.",
+        }
+    ],
+    "sfx": [
+        {
+            "id": "s_spellcast",
+            "name": "Arcane Magic Burst",
+            "category": "combat",
+            "purpose": "Casting spell",
+            "trigger": "Attack button",
+            "description": "Rising magical chime with powerful shockwave burst",
+            "duration": "2",
+            "generation_prompt": "Arcane magical burst with bright mystical chime and low energy pulse, isolated and clean.",
+        }
+    ],
+    "ambience": [
+        {
+            "id": "a_forest",
+            "name": "Enchanted Forest Canopy",
+            "purpose": "Overworld exploration",
+            "description": "Wind through ancient boughs, nocturnal birds, gentle magical shimmer",
+            "duration": "30",
+            "loop": True,
+            "generation_prompt": "Mystic enchanted forest ambience with gentle wind through leaves and subtle magic hum, seamless loop.",
+        }
+    ],
+}
 
-    plan = AudioPlan(
-        project=ProjectPlan(
-            title=theme["title"][:120],
-            description=idea[:500],
-            language=language[:50],
-        ),
-        voices=_list_of(theme, "voices", CharacterVoice),
-        dialogue=_list_of(theme, "dialogue", DialogueItem),
-        music=_list_of(theme, "music", MusicTrack),
-        sfx=_list_of(theme, "sfx", SfxItem),
-        ambience=_list_of(theme, "ambience", AmbienceItem),
-    )
-    return _backfill_plan(plan)
+_RACING_DEMO = {
+    "game": {
+        "title": "Neon Velocity 2099",
+        "genre": "Cyberpunk Anti-Grav Racing",
+        "audio_direction": "Relentless synthwave pulses, screaming turbine engines, and futuristic radio comms.",
+        "primary_mood": ["Futuristic", "Competitive", "High-Octane", "Aggressive"],
+        "environment": "Rain-soaked neon megacity, elevated magnetic highway, crowded grandstands",
+        "voice_style": "Fast, cocky, robotic, and urgent",
+        "music_direction": "Darksynth / Cyberpunk electronic, heavy arpeggios, 140 BPM",
+    },
+    "voices": [
+        {
+            "id": "v_crew",
+            "character": "Pit Chief Jax",
+            "role": "Radio Coach",
+            "gender": "male",
+            "age": "adult",
+            "personality": "Gruff, pragmatic racer",
+            "voice_type": "Grounded with radio filter",
+            "speaking_style": "Fast and decisive",
+            "kokoro_voice": "am_michael",
+            "speed": 1.1,
+            "pitch": "natural",
+            "style": "direct",
+            "voice_prompt": "Fast, direct pit crew chief giving race instructions over comms.",
+        }
+    ],
+    "dialogue": [
+        {
+            "id": "d_boost",
+            "character": "Pit Chief Jax",
+            "scene": "Lap 2",
+            "purpose": "Tactical callout",
+            "text": "Nitrous tank primed! Drain it down the long straightaway before they cut you off!",
+            "emotion": "urgent",
+            "speed": "fast",
+            "emphasis": "nitrous tank, straightaway",
+        }
+    ],
+    "music": [
+        {
+            "id": "m_race",
+            "title": "Overdrive Highway",
+            "purpose": "Main race track",
+            "mood": "High-octane cyberpunk",
+            "genre": "Darksynth",
+            "instruments": "Driving saw bass, distorted drums, neon lead synths",
+            "energy": "High",
+            "tempo": "142",
+            "duration": "30",
+            "loop": True,
+            "generation_prompt": "High-octane darksynth cyberpunk race track with heavy driving bass and fast synth arpeggios, energetic and intense, instrumental, no vocals, seamless loop.",
+        }
+    ],
+    "sfx": [
+        {
+            "id": "s_engine_boost",
+            "name": "Ion Engine Boost Ignition",
+            "category": "movement",
+            "purpose": "Nitro boost activation",
+            "trigger": "Boost key",
+            "description": "High-frequency plasma whine into a thunderous thruster roar",
+            "duration": "2",
+            "generation_prompt": "Sci-fi ion engine boost activating with high-pitched laser whine into powerful roar, isolated and clean.",
+        }
+    ],
+    "ambience": [
+        {
+            "id": "a_megacity",
+            "name": "Neon Megacity Paddock",
+            "purpose": "Garage and vehicle select",
+            "description": "Distant highway hover traffic, neon hum, light drizzle",
+            "duration": "30",
+            "loop": True,
+            "generation_prompt": "Cyberpunk megacity background with distant flying car traffic, gentle rain on metal and electrical hum, seamless loop.",
+        }
+    ],
+}
 
-
-def _theme_for(idea: str) -> str:
-    t = idea.lower()
-    if any(k in t for k in ("surf", "wave", "ocean", "water", "beach", "swim", "kayak", "boat", "pirate", "sea", "ship")):
-        return "water"
-    if any(k in t for k in ("space", "star", "planet", "galaxy", "alien", "cosmic", "rocket", "astro", "moon", "orbit")):
-        return "space"
-    if any(k in t for k in ("fantasy", "magic", "spell", "dragon", "knight", "wizard", "castle", "sword", "elf", "dungeon", "myth")):
-        return "fantasy"
-    if any(k in t for k in ("race", "racing", "car", "kart", "drift", "motor", "rally", "speed")):
-        return "racing"
-    return "generic"
+_GENERIC_DEMO = _HORROR_DEMO
